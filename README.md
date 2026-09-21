@@ -1,5 +1,5 @@
-# -
-苏州科技大学校园网登录器
+# 苏州科技大学校园网登录器
+<img width="700" height="607" alt="image" src="https://github.com/user-attachments/assets/2e7a0c47-afb1-4758-8b3a-48f20f6467cd" />
 
 ## 功能说明
 
