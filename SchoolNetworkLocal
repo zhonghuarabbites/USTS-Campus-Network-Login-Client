@@ -1,0 +1,863 @@
+#新增断网检测功能，可以设置间隔多少秒进行断连检测及自动拨号
+import tkinter as tk
+from tkinter import ttk, messagebox
+import json
+import os
+import urllib.request
+import urllib.parse
+import re
+import socket
+import threading
+import time
+
+# ============================================================
+# 改进点7【整体架构】：提取服务器地址、端口等硬编码常量
+# 避免登录/注销接口地址分散在各处导致不一致
+# ============================================================
+class ServerConfig:
+    """服务器配置常量类，集中管理所有网络相关地址和参数"""
+    SERVER_HOST = "10.160.63.9"
+    LOGIN_PORT = 801
+    LOGIN_URL = f"http://{SERVER_HOST}:{LOGIN_PORT}/eportal/?c=ACSetting&a=Login"
+    LOGOUT_URL = f"http://{SERVER_HOST}/eportal/?c=ACSetting&a=Logout&ver=1.0"
+    STATUS_URL = f"http://{SERVER_HOST}/drcom/chkstatus?callback=dr1234&jsVersion=3.0&_=1234567890"
+    REFERER_URL = f"http://{SERVER_HOST}/a79.htm"
+    DEFAULT_LOCAL_IP = "10.160.2.43"  # 改进点【get_local_ip】：硬编码IP提取为常量
+    SOCKET_CONNECT_IP = "10.160.63.9"
+    SOCKET_CONNECT_PORT = 80
+    CHECK_STATUS_TIMEOUT = 10  # 改进点【check_online_status】：超时从5秒提升到10秒
+    LOGIN_TIMEOUT = 15
+    LOGOUT_TIMEOUT = 10
+    CHECK_STATUS_RETRY_COUNT = 2  # 改进点【check_online_status】：增加重试机制
+    CHECK_STATUS_RETRY_DELAY = 1  # 重试间隔（秒）
+
+    # ============================================================
+    # 新增【定时检测 / 自动拨号】相关配置
+    # ============================================================
+    MONITOR_STATUS_TIMEOUT = 5           # 后台定时检测时探测认证服务器的超时（比手动检查更短，保证检测频率）
+    PROBE_TIMEOUT = 5                    # 外网探测超时（秒）
+    PROBE_URLS = (                       # 外网探测地址：返回204说明真的能上外网
+        "http://connect.rom.miui.com/generate_204",
+        "http://www.msftconnecttest.com/connecttest.txt",
+    )
+    # 门户/认证页特征词：出现这些说明被重定向到认证页，即"未认证"
+    PORTAL_MARKERS = ("eportal", "dr.com", "drcom", "wlanuserip", "10.160.63.9")
+    AUTO_CHECK_INTERVAL_DEFAULT = 10     # 默认检测间隔（秒）
+    AUTO_CHECK_INTERVAL_MIN = 5          # 检测间隔下限（秒）
+    AUTO_CHECK_INTERVAL_MAX = 600        # 检测间隔上限（秒）
+    AUTO_FAIL_THRESHOLD_DEFAULT = 2      # 连续多少次检测失败才判定掉线（防抖动误拨号）
+    AUTO_LOGIN_COOLDOWN = 20             # 两次自动拨号的最小间隔（秒），防止疯狂重拨
+    AUTO_LOGIN_RETRY_DELAY = 3           # 自动拨号失败后，下一次检测前的额外等待（秒）
+
+
+class CampusLoginApp:
+    # 运营商映射（从create_widgets中提升为类属性，避免每次创建控件时重复定义）
+    CARRIERS = {
+        "校园网": "@xyw",
+        "校园电信": "@dx",
+        "校园联通": "@lt",
+        "校园移动": ""
+    }
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("校园网登录器")
+        self.root.geometry("380x430")
+        self.root.resizable(False, False)
+
+        self.config_file = "config.json"
+        self.load_config()
+
+        # 新增【定时检测/自动拨号】：线程与状态初始化必须在创建控件之前完成
+        self.init_monitor_state()
+
+        self.create_widgets()
+
+        # 关闭窗口时先停掉后台监控线程，避免残留线程
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # 若配置里开启了自动重连，则启动后立即开始定时检测
+        if self.auto_var.get():
+            self.start_auto_monitor()
+
+    def init_monitor_state(self):
+        """初始化定时检测/自动拨号所需的全部状态。
+
+        注意：tkinter 不是线程安全的，后台线程只做网络操作，
+        任何界面刷新都必须通过 _ui() 用 root.after 投递回主线程执行。
+        """
+        self._monitor_thread = None
+        self._monitor_stop = threading.Event()   # 置位表示要求线程退出
+        self._monitor_wake = threading.Event()   # 用于可被立即打断的 sleep
+        self._monitor_lock = threading.Lock()    # 保护"拨号中"标记
+        self._offline_streak = 0                 # 连续检测失败次数
+        self._last_dial_ts = 0.0                 # 上次自动拨号的时间（time.monotonic）
+        self._auto_login_running = False         # 是否正在自动拨号，避免并发拨号
+        self._dial_failed_last = False           # 上一次自动拨号是否失败
+        self._auto_paused = False                # 手动注销后暂停自动拨号，避免注销完立刻被重新登录
+
+        # 主线程维护的凭证快照，供后台线程读取（跨线程读取 Tk 变量是不安全的）
+        self._cred = {"username": "", "password": "", "carrier": "@xyw"}
+
+        # 检测间隔 / 连续失败阈值：后台线程读的是这两个纯 Python 属性
+        self._interval = ServerConfig.AUTO_CHECK_INTERVAL_DEFAULT
+        self._fail_threshold = ServerConfig.AUTO_FAIL_THRESHOLD_DEFAULT
+
+        try:
+            cfg_interval = int(self.config.get("check_interval", ServerConfig.AUTO_CHECK_INTERVAL_DEFAULT))
+        except (TypeError, ValueError):
+            cfg_interval = ServerConfig.AUTO_CHECK_INTERVAL_DEFAULT
+        self._interval = max(
+            ServerConfig.AUTO_CHECK_INTERVAL_MIN,
+            min(ServerConfig.AUTO_CHECK_INTERVAL_MAX, cfg_interval)
+        )
+
+        try:
+            cfg_threshold = int(self.config.get("fail_threshold", ServerConfig.AUTO_FAIL_THRESHOLD_DEFAULT))
+        except (TypeError, ValueError):
+            cfg_threshold = ServerConfig.AUTO_FAIL_THRESHOLD_DEFAULT
+        self._fail_threshold = max(1, min(10, cfg_threshold))
+
+    def create_widgets(self):
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        ttk.Label(main_frame, text="账号:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.username_var = tk.StringVar(value=self.config.get("username", ""))
+        self.username_entry = ttk.Entry(main_frame, textvariable=self.username_var, width=30)
+        self.username_entry.grid(row=0, column=1, pady=5, padx=(5, 0))
+
+        ttk.Label(main_frame, text="密码:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.password_var = tk.StringVar(value=self.config.get("password", ""))
+        self.password_entry = ttk.Entry(main_frame, textvariable=self.password_var, show="*", width=30)
+        self.password_entry.grid(row=1, column=1, pady=5, padx=(5, 0))
+
+        ttk.Label(main_frame, text="运营商:").grid(row=2, column=0, sticky=tk.W, pady=5)
+
+        # 改进点【login】：运营商映射提升为类属性CARRIERS，避免每次实例化时重复创建字典
+        carrier_names = list(self.CARRIERS.keys())
+
+        saved_carrier_suffix = self.config.get("carrier", "@xyw")
+        saved_carrier_name = "校园用户"
+        for name, suffix in self.CARRIERS.items():
+            if suffix == saved_carrier_suffix:
+                saved_carrier_name = name
+                break
+
+        self.carrier_var = tk.StringVar(value=saved_carrier_name)
+        self.carrier_combo = ttk.Combobox(
+            main_frame,
+            textvariable=self.carrier_var,
+            values=carrier_names,
+            state="readonly",
+            width=28
+        )
+        self.carrier_combo.grid(row=2, column=1, pady=5, padx=(5, 0))
+
+        self.remember_var = tk.BooleanVar(value=self.config.get("remember", True))
+        ttk.Checkbutton(main_frame, text="记住密码", variable=self.remember_var).grid(
+            row=3, column=0, columnspan=2, sticky=tk.W, pady=10
+        )
+
+        # ============================================================
+        # 新增【定时检测 / 自动拨号】控件
+        # ============================================================
+        option_frame = ttk.Frame(main_frame)
+        option_frame.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=5)
+
+        self.auto_var = tk.BooleanVar(value=bool(self.config.get("auto_reconnect", True)))
+        self.auto_check = ttk.Checkbutton(
+            option_frame,
+            text="断网自动拨号",
+            variable=self.auto_var,
+            command=self.on_auto_toggle
+        )
+        self.auto_check.grid(row=0, column=0, sticky=tk.W)
+
+        self.interval_var = tk.StringVar(value=str(self._interval))
+        ttk.Label(option_frame, text="间隔(秒)").grid(row=0, column=1, padx=(12, 3))
+        self.interval_spin = ttk.Spinbox(
+            option_frame,
+            from_=ServerConfig.AUTO_CHECK_INTERVAL_MIN,
+            to=ServerConfig.AUTO_CHECK_INTERVAL_MAX,
+            increment=5,
+            width=5,
+            textvariable=self.interval_var
+        )
+        self.interval_spin.grid(row=0, column=2)
+
+        self.threshold_var = tk.StringVar(value=str(self._fail_threshold))
+        ttk.Label(option_frame, text="失败次数").grid(row=0, column=3, padx=(12, 3))
+        self.threshold_spin = ttk.Spinbox(
+            option_frame,
+            from_=1,
+            to=10,
+            increment=1,
+            width=3,
+            textvariable=self.threshold_var
+        )
+        self.threshold_spin.grid(row=0, column=4)
+
+        button_frame = ttk.Frame(main_frame)
+        button_frame.grid(row=5, column=0, columnspan=2, pady=10)
+
+        self.login_btn = ttk.Button(button_frame, text="登录", command=self.login, width=8)
+        self.login_btn.grid(row=0, column=0, padx=6)
+
+        self.logout_btn = ttk.Button(button_frame, text="注销", command=self.logout, width=8)
+        self.logout_btn.grid(row=0, column=1, padx=6)
+
+        # 手动触发一次检测，便于确认自动拨号是否生效
+        self.check_btn = ttk.Button(button_frame, text="立即检测", command=self.check_now, width=9)
+        self.check_btn.grid(row=0, column=2, padx=6)
+
+        self.status_label = ttk.Label(main_frame, text="", foreground="gray")
+        self.status_label.grid(row=6, column=0, columnspan=2, pady=5)
+
+        # 自动检测/自动拨号的运行日志（最近一次结果）
+        self.auto_status_label = ttk.Label(
+            main_frame,
+            text="",
+            foreground="gray",
+            wraplength=340,
+            justify=tk.LEFT
+        )
+        self.auto_status_label.grid(row=7, column=0, columnspan=2, pady=(0, 5), sticky=tk.W)
+
+        # 主线程监听输入变化，实时同步给后台线程使用的纯 Python 快照
+        for var in (self.username_var, self.password_var, self.carrier_var):
+            var.trace_add("write", self.sync_credentials)
+        self.interval_var.trace_add("write", self.sync_settings)
+        self.threshold_var.trace_add("write", self.sync_settings)
+        self.sync_credentials()
+
+    # ============================================================
+    # 改进点【load_config / save_config】：
+    # 1. 裸except替换为具体异常类型（json.JSONDecodeError, IOError/OSError）
+    # 2. save_config增加异常处理，防止文件不可写时崩溃
+    # ============================================================
+    def load_config(self):
+        self.config = {}
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    self.config = json.load(f)
+            except json.JSONDecodeError as e:
+                # 配置文件JSON格式错误时给出明确提示
+                messagebox.showwarning("配置警告", f"配置文件格式错误({e})，将使用默认配置")
+                self.config = {}
+            except IOError as e:
+                # 文件读取权限等IO异常
+                messagebox.showwarning("配置警告", f"读取配置文件失败: {e}，将使用默认配置")
+                self.config = {}
+            except OSError as e:
+                messagebox.showwarning("配置警告", f"操作系统错误: {e}，将使用默认配置")
+                self.config = {}
+
+    def save_config(self):
+        carrier_name = self.carrier_var.get()
+        carrier_suffix = self.CARRIERS.get(carrier_name, "@xyw")
+
+        # 新增：自动重连相关设置一并持久化（getattr 兼容控件尚未创建的调用场景）
+        auto_reconnect = bool(self.auto_var.get()) if hasattr(self, "auto_var") else True
+        check_interval = self._interval
+        fail_threshold = self._fail_threshold
+
+        if self.remember_var.get():
+            config = {
+                "username": self.username_var.get(),
+                "password": self.password_var.get(),
+                "carrier": carrier_suffix,
+                "remember": True
+            }
+        else:
+            config = {"remember": False}
+
+        config.update({
+            "auto_reconnect": auto_reconnect,
+            "check_interval": check_interval,
+            "fail_threshold": fail_threshold
+        })
+
+        try:
+            with open(self.config_file, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+        except IOError as e:
+            # 改进点：save_config原来没有异常处理，文件不可写时会崩溃
+            messagebox.showerror("保存失败", f"无法保存配置文件: {e}")
+        except OSError as e:
+            messagebox.showerror("保存失败", f"操作系统错误，无法保存配置: {e}")
+
+    # ============================================================
+    # 改进点【get_local_ip】：
+    # 1. 裸except替换为socket.error
+    # 2. 默认IP提取为ServerConfig常量
+    # ============================================================
+    def get_local_ip(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((ServerConfig.SOCKET_CONNECT_IP, ServerConfig.SOCKET_CONNECT_PORT))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except socket.error as e:
+            # 改进：使用具体异常类型socket.error而非裸except
+            return ServerConfig.DEFAULT_LOCAL_IP
+
+    # ============================================================
+    # 改进点【check_online_status】：
+    # 1. 裸except替换为具体异常
+    # 2. 超时从5秒提升到10秒
+    # 3. 增加重试机制
+    # ============================================================
+    def check_online_status(self, timeout=None, retries=None):
+        """检查当前在线状态，带重试机制
+
+        新增参数：timeout / retries 可覆盖默认值，
+        后台定时检测会传入更短的超时和更少的重试次数，避免长时间阻塞影响检测频率。
+        """
+        if timeout is None:
+            timeout = ServerConfig.CHECK_STATUS_TIMEOUT
+        if retries is None:
+            retries = ServerConfig.CHECK_STATUS_RETRY_COUNT
+        retries = max(1, int(retries))
+
+        for attempt in range(retries):
+            try:
+                req = urllib.request.Request(ServerConfig.STATUS_URL)
+                req.add_header(
+                    "User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                )
+
+                with urllib.request.urlopen(req, timeout=timeout) as response:
+                    result = response.read().decode("utf-8", errors="ignore")
+                    if '"result":1' in result or '"result": 1' in result:
+                        return True
+                    return False
+            except urllib.error.URLError as e:
+                # 改进：捕获具体异常类型urllib.error.URLError
+                if attempt < retries - 1:
+                    # 还有重试机会，等待后重试
+                    time.sleep(ServerConfig.CHECK_STATUS_RETRY_DELAY)
+                    continue
+                return False
+            except socket.timeout as e:
+                # 改进：单独处理超时异常
+                if attempt < retries - 1:
+                    time.sleep(ServerConfig.CHECK_STATUS_RETRY_DELAY)
+                    continue
+                return False
+            except Exception as e:
+                # 其他未知异常也重试
+                if attempt < retries - 1:
+                    time.sleep(ServerConfig.CHECK_STATUS_RETRY_DELAY)
+                    continue
+                return False
+        return False
+
+    # ============================================================
+    # 改进点【login】：
+    # 1. 参数字典封装为独立方法build_login_params
+    # 2. 登录成功后清除之前的错误状态
+    # ============================================================
+    def build_login_params(self, username, password, carrier, user_ip):
+        """构建登录请求参数字典（改进点：将过长的参数字典提取为独立方法）"""
+        return {
+            "DDDDD": ",1," + username + carrier,
+            "upass": password,
+            "0MKKey": "Login",
+            "buttonClicked": "",
+            "redirect_url": "",
+            "err_flag": "",
+            "username_suffix": "",
+            "user": username,
+            "password": password,
+            "user_type": "1",
+            "loginurl": "",
+            "radius_nasip": "",
+            "radius_nasportid": "",
+            "acession_mac": "",
+            "user_mac": "000000000000",
+            "wlan_user_ip": user_ip,
+            "wlan_user_mac": "000000000000",
+            "vlanid": "0",
+            "nasportid": ""
+        }
+
+    def build_logout_params(self, username, carrier, user_ip):
+        """构建注销请求参数字典"""
+        return {
+            "DDDDD": ",1," + username + carrier,
+            "upass": "",
+            "user_ip": user_ip,
+            "wlan_user_ip": user_ip
+        }
+
+    def perform_login(self, username, password, carrier):
+        """纯网络登录逻辑（不含任何界面操作），返回 (是否成功, 提示信息)。
+
+        新增：从原 login() 中抽出，供"手动登录"和"自动拨号"共用，
+        因为后台监控线程里不能安全地操作 tkinter 控件和弹窗。
+        """
+        username = (username or "").strip()
+        password = (password or "").strip()
+        if not username or not password:
+            return False, "账号或密码为空"
+
+        user_ip = self.get_local_ip()
+        params = self.build_login_params(username, password, carrier, user_ip)
+        data = urllib.parse.urlencode(params).encode("utf-8")
+
+        try:
+            req = urllib.request.Request(ServerConfig.LOGIN_URL, data=data, method="POST")
+            req.add_header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            )
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            req.add_header("Referer", ServerConfig.REFERER_URL + "?wlanuserip=" + user_ip)
+
+            with urllib.request.urlopen(req, timeout=ServerConfig.LOGIN_TIMEOUT) as response:
+                result = response.read().decode("utf-8", errors="ignore")
+
+            if "login_ok" in result.lower() or "Dr.COMWebLoginID_3.htm" in result:
+                return True, "登录成功"
+            return False, self.parse_login_result(result)
+        except urllib.error.URLError as e:
+            return False, f"无法连接认证服务器: {e}"
+        except Exception as e:
+            return False, f"登录异常: {e}"
+
+    def login(self):
+        username = self.username_var.get().strip()
+        password = self.password_var.get().strip()
+        carrier_name = self.carrier_var.get()
+        carrier = self.CARRIERS.get(carrier_name, "@xyw")
+
+        if not username or not password:
+            messagebox.showwarning("提示", "请输入账号和密码")
+            return
+
+        # 清除之前的错误状态（改进点）
+        self.status_label.config(text="", foreground="gray")
+
+        self.save_config()
+        self.login_btn.config(state="disabled")
+        self.status_label.config(text="正在登录...", foreground="blue")
+        self.root.update()
+
+        ok, msg = self.perform_login(username, password, carrier)
+
+        self.login_btn.config(state="normal")
+
+        if ok:
+            # 手动登录成功：恢复被"手动注销"暂停的自动拨号，并重置检测状态
+            self._auto_paused = False
+            self._offline_streak = 0
+            self._last_dial_ts = 0.0
+            self.status_label.config(text="登录成功", foreground="green")
+            if self.auto_var.get():
+                self.set_auto_status("自动重连运行中（登录成功，继续定时检测）", "green")
+            messagebox.showinfo("成功", "登录成功！")
+        elif msg.startswith("无法连接认证服务器"):
+            self.status_label.config(text="网络错误", foreground="red")
+            messagebox.showerror("网络错误", f"{msg}\n请检查网络连接")
+        else:
+            self.status_label.config(text="登录失败", foreground="red")
+            messagebox.showerror("登录失败", msg)
+
+    # ============================================================
+    # 改进点【parse_login_result】：
+    # 1. 调整正则匹配优先级：更精确的模式放前面，模糊的放后面
+    # 2. "error"泛匹配放到最后，避免提前截断其他更精确的匹配
+    # ============================================================
+    def parse_login_result(self, html):
+        if not html:
+            return "服务器返回空响应"
+
+        html_lower = html.lower()
+
+        # 精确字符串匹配优先（不含正则，优先级最高）
+        if "Dr.COMWebLoginID_2.htm" in html:
+            return "认证失败，请检查账号密码是否正确"
+
+        # 改进点：调整正则匹配顺序，更精确的模式放前面
+        # 原来"error"放在最后会匹配到所有包含error的字符串，
+        # 但现在调整了顺序，更具体的错误先匹配
+        error_patterns = [
+            # 精确关键词匹配（优先级高）
+            (r"password\s*error", "密码错误"),
+            (r"userid\s*error", "账号不存在"),
+            (r"account\s*not\s*exist", "账号不存在"),
+            (r"account\s*disabled", "账号已停用"),
+            (r"account\s*expired", "账号已过期"),
+            (r"balance\s*not\s*enough", "账户余额不足"),
+            (r"arrearage", "账户已欠费"),
+            (r"max\s*connections", "在线用户数已达上限"),
+            (r"already\s*online", "账号已在线"),
+            (r"auth\s*fail", "认证失败"),
+            # 泛匹配放最后（优先级最低）
+            (r"\berror\b", "账号或密码错误"),
+        ]
+
+        for pattern, msg in error_patterns:
+            if re.search(pattern, html_lower):
+                return msg
+
+        if len(html) < 300:
+            return f"服务器返回: {html}"
+
+        return "登录失败，请检查账号密码"
+
+    # ============================================================
+    # 改进点【logout】：
+    # 1. 注销接口URL使用ServerConfig常量，与登录接口统一管理
+    # 2. 参数构建提取为build_logout_params方法
+    # ============================================================
+    def logout(self):
+        self.logout_btn.config(state="disabled")
+        self.status_label.config(text="正在注销...", foreground="blue")
+        self.root.update()
+
+        # 先检查是否在线
+        is_online_before = self.check_online_status()
+
+        if not is_online_before:
+            self.status_label.config(text="当前不在线", foreground="orange")
+            messagebox.showinfo("提示", "当前不在线，无需注销")
+            self.logout_btn.config(state="normal")
+            return
+
+        username = self.username_var.get().strip()
+        carrier_name = self.carrier_var.get()
+        carrier = self.CARRIERS.get(carrier_name, "@xyw")
+        full_username = username + carrier
+        user_ip = self.get_local_ip()
+
+        # 改进点：使用ServerConfig常量统一管理注销URL（端口与登录接口一致性问题消除）
+        url = ServerConfig.LOGOUT_URL
+        params = self.build_logout_params(username, carrier, user_ip)
+        data = urllib.parse.urlencode(params).encode("utf-8")
+
+        try:
+            req = urllib.request.Request(url, data=data, method="POST")
+            req.add_header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            )
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+
+            resp = urllib.request.urlopen(req, timeout=ServerConfig.LOGOUT_TIMEOUT)
+            html = resp.read().decode("gbk", errors="ignore")
+
+            time.sleep(1)
+
+            # 尝试检查在线状态，如果断网说明注销成功
+            is_online_after = self.check_online_status()
+
+            if not is_online_after:
+                self.status_label.config(text="注销成功", foreground="green")
+                self.pause_auto_after_logout()
+                messagebox.showinfo("成功", "注销成功！")
+            elif "Dr.COMWebLoginID_3.htm" in html:
+                self.status_label.config(text="注销成功", foreground="green")
+                self.pause_auto_after_logout()
+                messagebox.showinfo("成功", "注销成功！")
+            else:
+                self.status_label.config(text="注销失败", foreground="red")
+                messagebox.showerror("失败", "注销失败，请稍后重试")
+        except urllib.error.URLError:
+            # 网络断开说明注销成功
+            self.status_label.config(text="注销成功", foreground="green")
+            self.pause_auto_after_logout()
+            messagebox.showinfo("成功", "注销成功！")
+        except Exception as e:
+            self.status_label.config(text="连接失败", foreground="red")
+            messagebox.showerror("错误", f"连接失败: {str(e)}")
+        finally:
+            self.logout_btn.config(state="normal")
+
+
+    # ============================================================
+    # 新增【定时检测网络通断 + 断网自动拨号】
+    # 设计要点：
+    # 1. tkinter 非线程安全 → 后台线程只做网络 IO，界面刷新一律经 ui_call() 回主线程；
+    # 2. 连续 N 次检测失败才判定掉线，避免瞬时抖动导致反复拨号；
+    # 3. 自动拨号有冷却时间（AUTO_LOGIN_COOLDOWN），拨号失败不会疯狂重拨；
+    # 4. 手动点「注销」后会暂停自动拨号，避免刚注销就被自动登录回去。
+    # ============================================================
+    def ui_call(self, func, *args):
+        """把后台线程的界面更新请求安全地投递到主线程执行"""
+        try:
+            self.root.after(0, lambda: func(*args))
+        except (tk.TclError, RuntimeError):
+            # 窗口已销毁时忽略
+            pass
+
+    def set_auto_status(self, text, color="gray"):
+        """更新自动检测状态文字（只在主线程调用）"""
+        try:
+            self.auto_status_label.config(text=text, foreground=color)
+        except tk.TclError:
+            pass
+
+    def sync_credentials(self, *_):
+        """主线程维护凭证快照，供后台线程读取（跨线程直接读 Tk 变量不安全）"""
+        self._cred = {
+            "username": self.username_var.get().strip(),
+            "password": self.password_var.get().strip(),
+            "carrier": self.CARRIERS.get(self.carrier_var.get(), "@xyw")
+        }
+
+    def sync_settings(self, *_):
+        """把"检测间隔/失败次数"两个输入同步为后台线程可安全读取的整数属性"""
+        try:
+            interval = int(float(self.interval_var.get()))
+        except (TypeError, ValueError):
+            interval = self._interval
+        # 超范围时直接夹紧数值，而不是回写输入框（回写会再次触发 trace 造成循环）
+        self._interval = max(
+            ServerConfig.AUTO_CHECK_INTERVAL_MIN,
+            min(ServerConfig.AUTO_CHECK_INTERVAL_MAX, interval)
+        )
+
+        try:
+            threshold = int(float(self.threshold_var.get()))
+        except (TypeError, ValueError):
+            threshold = self._fail_threshold
+        self._fail_threshold = max(1, min(10, threshold))
+
+    def on_auto_toggle(self):
+        """勾选/取消「断网自动拨号」"""
+        if self.auto_var.get():
+            self.start_auto_monitor()
+        else:
+            self.stop_auto_monitor()
+        self.save_config()
+
+    def start_auto_monitor(self):
+        """启动后台定时检测线程（重复调用不会产生多个线程）"""
+        thread = self._monitor_thread
+        if thread and thread.is_alive():
+            if self._monitor_stop.is_set():
+                # 上一个线程还没有从探测中退出：等它真正结束后再起新线程，
+                # 否则会误判"已在运行"，导致重新勾选后其实没有线程在检测
+                self._monitor_wake.set()
+                thread.join(timeout=ServerConfig.MONITOR_STATUS_TIMEOUT + ServerConfig.PROBE_TIMEOUT)
+                if thread.is_alive():
+                    self.set_auto_status("检测线程正在退出，请稍后再勾选「断网自动拨号」", "orange")
+                    return
+            else:
+                self._monitor_wake.set()
+                return
+
+        self._monitor_stop.clear()
+        self._monitor_wake.clear()
+        self._offline_streak = 0
+        self._auto_paused = False
+        self._dial_failed_last = False
+
+        self._monitor_thread = threading.Thread(
+            target=self.monitor_loop,
+            name="SchoolNetMonitor",
+            daemon=True
+        )
+        self._monitor_thread.start()
+
+        self.set_auto_status(f"自动重连已开启：每 {self._interval} 秒检测一次网络", "green")
+
+    def stop_auto_monitor(self):
+        """停止后台定时检测线程"""
+        self._monitor_stop.set()
+        self._monitor_wake.set()  # 立刻唤醒正在等待的线程，避免最多等一个间隔才退出
+        self.set_auto_status("自动重连已关闭（不再定时检测网络）", "gray")
+
+    def monitor_loop(self):
+        """后台检测主循环：检测 → 等待间隔 → 再检测（线程内禁止操作界面）"""
+        while not self._monitor_stop.is_set():
+            try:
+                self.check_once()
+            except Exception as e:
+                # 任何未预期异常都不能让监控线程退出
+                self.ui_call(self.set_auto_status, f"检测异常: {e}", "red")
+
+            wait_seconds = self._interval
+            if self._dial_failed_last:
+                # 拨号失败后多等一会，避免与冷却时间叠加时过于频繁地重试
+                wait_seconds += ServerConfig.AUTO_LOGIN_RETRY_DELAY
+
+            self._monitor_wake.wait(wait_seconds)
+            self._monitor_wake.clear()
+
+    def check_once(self):
+        """执行一次检测，必要时自动拨号（在后台线程中运行）"""
+        now_text = time.strftime("%H:%M:%S")
+        online, detail = self.probe_network()
+
+        if online:
+            self._offline_streak = 0
+            self._dial_failed_last = False
+            self.ui_call(self.set_auto_status, f"[{now_text}] 网络正常（{detail}）", "green")
+            return
+
+        self._offline_streak += 1
+        if self._offline_streak < self._fail_threshold:
+            # 未达到连续失败阈值，可能只是抖动或正常波动
+            self.ui_call(
+                self.set_auto_status,
+                f"[{now_text}] 检测失败 {self._offline_streak}/{self._fail_threshold}（{detail}）",
+                "orange"
+            )
+            return
+
+        if self._auto_paused:
+            self.ui_call(self.set_auto_status, f"[{now_text}] 网络离线，但已手动注销，自动拨号暂停", "orange")
+            return
+
+        # 冷却时间：两次自动拨号之间至少间隔 AUTO_LOGIN_COOLDOWN 秒
+        since_last = time.monotonic() - self._last_dial_ts
+        if since_last < ServerConfig.AUTO_LOGIN_COOLDOWN:
+            remain = int(ServerConfig.AUTO_LOGIN_COOLDOWN - since_last) + 1
+            self.ui_call(self.set_auto_status, f"[{now_text}] 网络离线，{remain} 秒后重试拨号", "red")
+            return
+
+        cred = dict(self._cred)
+        if not cred["username"] or not cred["password"]:
+            self.ui_call(self.set_auto_status, f"[{now_text}] 网络离线，但账号或密码为空，无法自动拨号", "red")
+            return
+
+        with self._monitor_lock:
+            if self._auto_login_running:
+                return
+            self._auto_login_running = True
+
+        try:
+            self._last_dial_ts = time.monotonic()
+            self.ui_call(self.set_auto_status, f"[{now_text}] 检测到断网，正在自动拨号...", "blue")
+
+            ok, msg = self.perform_login(cred["username"], cred["password"], cred["carrier"])
+            done_text = time.strftime("%H:%M:%S")
+
+            if ok:
+                self._offline_streak = 0
+                self._dial_failed_last = False
+                # 拨号成功后再确认一次，防止"假成功"
+                verified, vdetail = self.probe_network()
+                if verified:
+                    self.ui_call(self.set_auto_status, f"[{done_text}] 自动拨号成功，网络已恢复（{vdetail}）", "green")
+                else:
+                    self.ui_call(self.set_auto_status, f"[{done_text}] 拨号返回成功，但网络仍不通，稍后重试", "orange")
+            else:
+                self._dial_failed_last = True
+                self.ui_call(self.set_auto_status, f"[{done_text}] 自动拨号失败：{msg}", "red")
+        finally:
+            with self._monitor_lock:
+                self._auto_login_running = False
+
+    def probe_network(self):
+        """判断当前是否真的能用网，返回 (是否在线, 说明文字)"""
+        # 1) 认证服务器在线状态：校园网里这是最直接的判据
+        if self.check_online_status(
+            timeout=ServerConfig.MONITOR_STATUS_TIMEOUT,
+            retries=1
+        ):
+            return True, "认证服务器显示在线"
+
+        # 2) 外网探测兜底：认证服务器不可达但外网能通，就不必拨号
+        if self.probe_internet():
+            return True, "外网探测可达"
+
+        return False, "认证服务器与外网探测均失败"
+
+    def probe_internet(self):
+        """访问 generate_204 类地址判断是否能真正访问外网（能防"门户劫持"误判）"""
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+        for url in ServerConfig.PROBE_URLS:
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=ServerConfig.PROBE_TIMEOUT) as resp:
+                    code = getattr(resp, "status", None) or resp.getcode()
+
+                    if code == 204:
+                        # 标准 generate_204 返回 204，说明真的能上外网
+                        return True
+
+                    body = resp.read(2048).decode("utf-8", errors="ignore").lower()
+                    if any(marker in body for marker in ServerConfig.PORTAL_MARKERS):
+                        # 被重定向到认证页，说明还没认证，继续探测下一个
+                        continue
+
+                    if code == 200:
+                        return True
+            except urllib.error.URLError:
+                continue
+            except socket.timeout:
+                continue
+            except Exception:
+                continue
+
+        return False
+
+    def check_now(self):
+        """手动触发一次网络检测（放到子线程执行，避免长时间探测卡住界面）"""
+        try:
+            self.check_btn.config(state="disabled")
+        except tk.TclError:
+            pass
+        self.set_auto_status("正在检测网络...", "blue")
+
+        def worker():
+            online, detail = self.probe_network()
+            self.ui_call(self.on_check_now_done, online, detail)
+
+        threading.Thread(target=worker, name="SchoolNetCheckOnce", daemon=True).start()
+
+    def on_check_now_done(self, online, detail):
+        """手动检测完成后的界面更新（主线程）"""
+        try:
+            self.check_btn.config(state="normal")
+        except tk.TclError:
+            pass
+
+        now_text = time.strftime("%H:%M:%S")
+        if online:
+            self._offline_streak = 0
+            self.status_label.config(text="当前在线", foreground="green")
+            self.set_auto_status(f"[{now_text}] 网络正常（{detail}）", "green")
+        else:
+            self.status_label.config(text="当前离线", foreground="red")
+            self.set_auto_status(f"[{now_text}] 检测到断网（{detail}）", "red")
+
+    def pause_auto_after_logout(self):
+        """手动注销成功后暂停自动拨号，否则检测到掉线会立刻把账号重新登录回去"""
+        self._auto_paused = True
+        self._offline_streak = 0
+        self._last_dial_ts = time.monotonic()
+
+        if self.auto_var.get():
+            self.set_auto_status("已手动注销，自动拨号暂停（点「登录」成功后自动恢复）", "orange")
+
+    def on_close(self):
+        """关闭窗口：先停后台线程再销毁窗口，避免线程访问已销毁的控件报错"""
+        self._monitor_stop.set()
+        self._monitor_wake.set()
+
+        thread = self._monitor_thread
+        if thread and thread.is_alive():
+            thread.join(timeout=ServerConfig.MONITOR_STATUS_TIMEOUT + ServerConfig.PROBE_TIMEOUT)
+
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+
+def main():
+    root = tk.Tk()
+    app = CampusLoginApp(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
